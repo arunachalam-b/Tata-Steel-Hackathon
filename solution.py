@@ -26,15 +26,19 @@ SAMPLE_PATH = DATA_DIR / "sample_submission.csv"
 
 PRIMARY_SUBMISSION = Path("expected_submission.csv")
 TOPK_SUBMISSIONS = {
-    10: Path("expected_submission_top10.csv"),
     15: Path("expected_submission_top15.csv"),
-    17: Path("expected_submission_top17.csv"),
     20: Path("expected_submission_top20.csv"),
     25: Path("expected_submission_top25.csv"),
+    30: Path("expected_submission_top30.csv"),
     35: Path("expected_submission_top35.csv"),
+    40: Path("expected_submission_top40.csv"),
+    45: Path("expected_submission_top45.csv"),
     50: Path("expected_submission_top50.csv"),
+    60: Path("expected_submission_top60.csv"),
     75: Path("expected_submission_top75.csv"),
     100: Path("expected_submission_top100.csv"),
+    150: Path("expected_submission_top150.csv"),
+    200: Path("expected_submission_top200.csv"),
 }
 F1_SUBMISSION = Path("expected_submission_best_f1.csv")
 GAP_SUBMISSION = Path("expected_submission_natural_gap.csv")
@@ -47,6 +51,8 @@ N_SPLITS = 5
 N_SEEDS = 3
 BASE_SEED = 42
 RECALL_SAFETY_MARGIN = 0.90
+
+NOISE_DROP_COUNT = 120
 
 ROLLING_WINDOWS = [3, 5, 10, 20, 50]
 LAG_OFFSETS = [1, 2, 3, 5]
@@ -283,31 +289,19 @@ def _attach_target_encoding(rows: pd.DataFrame, te_table: pd.DataFrame) -> pd.Da
     return rows.merge(te_table, on=ID_COL, how="left")
 
 
-def train_with_cv(
-    static_features: pd.DataFrame,
-    static_feature_columns: list[str],
-    train_ids: np.ndarray,
-    test_ids: np.ndarray,
+def _run_cv_pass(
+    train_table: pd.DataFrame,
     targets: np.ndarray,
-) -> TrainedEnsemble:
-    n_train = len(train_ids)
-    n_test = len(test_ids)
+    feature_columns: list[str],
+    x_test: pd.DataFrame,
+    pos_weight: float,
+) -> tuple[np.ndarray, np.ndarray]:
+    n_train = len(train_table)
+    n_test = len(x_test)
     n_base_models = 3
 
     oof_per_model = np.zeros((n_train, n_base_models), dtype=np.float64)
     test_per_model = np.zeros((n_test, n_base_models), dtype=np.float64)
-
-    all_coil_ids_sorted = static_features.sort_values(ID_COL)[ID_COL].to_numpy()
-    te_table = compute_target_encoding(all_coil_ids_sorted, train_ids, targets)
-    enriched = static_features.merge(te_table, on=ID_COL, how="left")
-    train_table = _select_by_coil(enriched, train_ids)
-    test_table = _select_by_coil(enriched, test_ids)
-
-    te_columns = [f"te_neighbor_{w}" for w in TARGET_WINDOWS]
-    feature_columns = static_feature_columns + te_columns
-    pos_weight = float((targets == 0).sum()) / max(float((targets == 1).sum()), 1.0)
-
-    x_test = test_table[feature_columns]
     total_test_runs = 0
 
     for seed_offset in range(N_SEEDS):
@@ -337,44 +331,99 @@ def train_with_cv(
 
     oof_per_model /= N_SEEDS
     test_per_model /= total_test_runs
+    return oof_per_model, test_per_model
 
-    oof_probabilities = oof_per_model.mean(axis=1)
-    test_probabilities = test_per_model.mean(axis=1)
 
+def _stack_or_mean(oof_per_model: np.ndarray, test_per_model: np.ndarray, targets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    mean_oof = oof_per_model.mean(axis=1)
+    mean_test = test_per_model.mean(axis=1)
     meta = LogisticRegression(C=1.0, class_weight="balanced", max_iter=2000)
     meta.fit(oof_per_model, targets)
-    oof_meta = meta.predict_proba(oof_per_model)[:, 1]
-    test_meta = meta.predict_proba(test_per_model)[:, 1]
+    meta_oof = meta.predict_proba(oof_per_model)[:, 1]
+    meta_test = meta.predict_proba(test_per_model)[:, 1]
+    if roc_auc_score(targets, meta_oof) > roc_auc_score(targets, mean_oof):
+        print(f"[stacker] meta-AUC={roc_auc_score(targets, meta_oof):.4f} beats mean-AUC={roc_auc_score(targets, mean_oof):.4f}")
+        return meta_oof, meta_test
+    print(f"[stacker] keeping mean (mean-AUC={roc_auc_score(targets, mean_oof):.4f} >= meta-AUC={roc_auc_score(targets, meta_oof):.4f})")
+    return mean_oof, mean_test
 
-    if roc_auc_score(targets, oof_meta) > roc_auc_score(targets, oof_probabilities):
-        print(f"[stacker] meta-AUC={roc_auc_score(targets, oof_meta):.4f} beats mean-AUC={roc_auc_score(targets, oof_probabilities):.4f}")
-        oof_probabilities = oof_meta
-        test_probabilities = test_meta
-    else:
-        print(f"[stacker] keeping mean (mean-AUC={roc_auc_score(targets, oof_probabilities):.4f} >= meta-AUC={roc_auc_score(targets, oof_meta):.4f})")
+
+def _identify_noisy_negatives(targets: np.ndarray, oof_probabilities: np.ndarray, drop_count: int) -> np.ndarray:
+    negative_positions = np.where(targets == 0)[0]
+    negative_probs = oof_probabilities[negative_positions]
+    sorted_by_suspicion = negative_positions[np.argsort(negative_probs)[::-1]]
+    return sorted_by_suspicion[:drop_count]
+
+
+def train_with_cv(
+    static_features: pd.DataFrame,
+    static_feature_columns: list[str],
+    train_ids: np.ndarray,
+    test_ids: np.ndarray,
+    targets: np.ndarray,
+) -> TrainedEnsemble:
+    all_coil_ids_sorted = static_features.sort_values(ID_COL)[ID_COL].to_numpy()
+    te_table = compute_target_encoding(all_coil_ids_sorted, train_ids, targets)
+    enriched = static_features.merge(te_table, on=ID_COL, how="left")
+    train_table = _select_by_coil(enriched, train_ids)
+    test_table = _select_by_coil(enriched, test_ids)
+
+    te_columns = [f"te_neighbor_{w}" for w in TARGET_WINDOWS]
+    feature_columns = static_feature_columns + te_columns
+
+    x_test = test_table[feature_columns]
+    pos_weight = float((targets == 0).sum()) / max(float((targets == 1).sum()), 1.0)
+
+    print(f"[pass 1] training on full {len(train_table)} rows ({int((targets==1).sum())} positives)")
+    oof1_per_model, _ = _run_cv_pass(train_table, targets, feature_columns, x_test, pos_weight)
+    oof1, _ = _stack_or_mean(oof1_per_model, np.zeros_like(oof1_per_model), targets)
+    print(f"[pass 1] OOF AUC={roc_auc_score(targets, oof1):.4f}")
+
+    noisy_negatives = _identify_noisy_negatives(targets, oof1, NOISE_DROP_COUNT)
+    keep_mask = np.ones(len(targets), dtype=bool)
+    keep_mask[noisy_negatives] = False
+
+    clean_table = train_table.iloc[keep_mask].reset_index(drop=True)
+    clean_targets = targets[keep_mask]
+    clean_pos_weight = float((clean_targets == 0).sum()) / max(float((clean_targets == 1).sum()), 1.0)
+
+    print(f"[pass 2] training on cleaned {len(clean_table)} rows after dropping {NOISE_DROP_COUNT} noisy negatives")
+    oof2_per_model, test_per_model = _run_cv_pass(clean_table, clean_targets, feature_columns, x_test, clean_pos_weight)
+    oof_clean, test_probabilities = _stack_or_mean(oof2_per_model, test_per_model, clean_targets)
+    print(f"[pass 2] OOF AUC (clean subset)={roc_auc_score(clean_targets, oof_clean):.4f}")
+
+    full_oof = np.full(len(targets), np.nan)
+    full_oof[keep_mask] = oof_clean
 
     return TrainedEnsemble(
         feature_columns=feature_columns,
-        oof_probabilities=oof_probabilities,
+        oof_probabilities=full_oof,
         oof_targets=targets,
         test_probabilities=test_probabilities,
     )
 
 
+def _valid_subset(oof_probabilities: np.ndarray, oof_targets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    valid_mask = ~np.isnan(oof_probabilities)
+    return oof_probabilities[valid_mask], oof_targets[valid_mask]
+
+
 def recall_one_threshold(oof_probabilities: np.ndarray, oof_targets: np.ndarray) -> float:
-    positive_probs = oof_probabilities[oof_targets == 1]
+    probs, tgts = _valid_subset(oof_probabilities, oof_targets)
+    positive_probs = probs[tgts == 1]
     if len(positive_probs) == 0:
         return 0.5
     return float(positive_probs.min()) * RECALL_SAFETY_MARGIN
 
 
 def best_f1_threshold(oof_probabilities: np.ndarray, oof_targets: np.ndarray) -> float:
-    candidates = np.unique(np.round(oof_probabilities, 4))
+    probs, tgts = _valid_subset(oof_probabilities, oof_targets)
+    candidates = np.unique(np.round(probs, 4))
     best_threshold = 0.5
     best_score = -1.0
     for candidate in candidates:
-        predictions = (oof_probabilities >= candidate).astype(int)
-        score = f1_score(oof_targets, predictions, zero_division=0)
+        predictions = (probs >= candidate).astype(int)
+        score = f1_score(tgts, predictions, zero_division=0)
         if score > best_score:
             best_score = score
             best_threshold = float(candidate)
@@ -382,27 +431,32 @@ def best_f1_threshold(oof_probabilities: np.ndarray, oof_targets: np.ndarray) ->
 
 
 def evaluate_threshold(oof_probabilities: np.ndarray, oof_targets: np.ndarray, threshold: float) -> dict:
-    predictions = (oof_probabilities >= threshold).astype(int)
+    probs, tgts = _valid_subset(oof_probabilities, oof_targets)
+    predictions = (probs >= threshold).astype(int)
     return {
         "threshold": threshold,
-        "recall": recall_score(oof_targets, predictions, zero_division=0),
-        "precision": precision_score(oof_targets, predictions, zero_division=0),
-        "f1": f1_score(oof_targets, predictions, zero_division=0),
+        "recall": recall_score(tgts, predictions, zero_division=0),
+        "precision": precision_score(tgts, predictions, zero_division=0),
+        "f1": f1_score(tgts, predictions, zero_division=0),
         "predicted_positives": int(predictions.sum()),
-        "actual_positives": int(oof_targets.sum()),
+        "actual_positives": int(tgts.sum()),
+        "evaluated_rows": int(len(tgts)),
     }
 
 
 def describe_oof(oof_probabilities: np.ndarray, oof_targets: np.ndarray) -> None:
-    pos_probs = np.sort(oof_probabilities[oof_targets == 1])
-    neg_probs = np.sort(oof_probabilities[oof_targets == 0])
-    print(f"OOF ROC-AUC: {roc_auc_score(oof_targets, oof_probabilities):.4f}")
-    print(f"OOF PR-AUC : {average_precision_score(oof_targets, oof_probabilities):.4f}")
+    probs, tgts = _valid_subset(oof_probabilities, oof_targets)
+    pos_probs = np.sort(probs[tgts == 1])
+    neg_probs = np.sort(probs[tgts == 0])
+    print(f"OOF ROC-AUC: {roc_auc_score(tgts, probs):.4f} (over {len(tgts)} evaluated rows)")
+    print(f"OOF PR-AUC : {average_precision_score(tgts, probs):.4f}")
     print(f"positive probs lowest 10: {pos_probs[:10]}")
     print(f"positive probs highest 5: {pos_probs[-5:]}")
     print(f"negative probs highest 10: {neg_probs[-10:]}")
     for k in (5, 10, 15, 20, 30):
-        threshold = pos_probs[min(k - 1, len(pos_probs) - 1)]
+        if k > len(pos_probs):
+            continue
+        threshold = pos_probs[k - 1]
         metrics = evaluate_threshold(oof_probabilities, oof_targets, threshold)
         print(
             f"  drop {k - 1} hardest positives -> threshold={threshold:.5f} "
